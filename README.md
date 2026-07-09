@@ -11,9 +11,9 @@ to fix one specific, real footgun — races, deadlocks, or goroutine leaks
 
 Import only what you need; the packages don't depend on each other.
 
-```bash
-go get github.com/SimiyuWafulah/goconc
-```
+> **Status: v0.x.** The API is usable now but may still change before a
+> `v1.0.0` is tagged. Breaking changes will be called out in release
+> notes; feedback and issues are welcome.
 
 ## Why this exists
 
@@ -39,7 +39,7 @@ under concurrent writes) — this isn't a hypothetical exercise.
 | Package | Import path | Problem it solves |
 |---|---|---|
 | [`safemap`](./safemap) | `github.com/SimiyuWafulah/goconc/safemap` | Generic, goroutine-safe map — no more hand-rolled `RWMutex` + `map` |
-| [`pool`](./pool) | `github.com/SimiyuWafulah/goconc/pool` | Bounded, context-aware worker pool — caps concurrency, cancellation actually stops queued work |
+| [`pool`](./pool) | `github.com/SimiyuWafulah/goconc/pool` | Bounded, context-aware worker pool — caps concurrency; queued work is canceled before it starts, and running work can stop early if it respects the provided context |
 | [`once`](./once) | `github.com/SimiyuWafulah/goconc/once` | `Group`: safe run-and-collect-first-error helper, replacing hand-rolled `WaitGroup` + shared error variable |
 | [`deadline`](./deadline) | `github.com/SimiyuWafulah/goconc/deadline` | A mutex with an acquisition timeout — turns silent deadlocks into a loggable error |
 | [`leakcheck`](./leakcheck) | `github.com/SimiyuWafulah/goconc/leakcheck` | Test helper that fails a test if it leaves goroutines running |
@@ -47,6 +47,37 @@ under concurrent writes) — this isn't a hypothetical exercise.
 Each package has its own doc comment (readable via `go doc` or
 [pkg.go.dev](https://pkg.go.dev/github.com/SimiyuWafulah/goconc)) and a
 runnable example under [`examples/`](./examples).
+
+### Why not just use the standard library?
+
+You often should — these packages only earn their place where the
+plain standard-library pattern has a well-known sharp edge:
+
+| Need | Plain standard library | goconc |
+|---|---|---|
+| Map shared across goroutines | `map` + `sync.RWMutex`, hand-rolled | `safemap.Map[K, V]` |
+| Bounded concurrent work with cancellation | `go func(){}()` in a loop, no cap, no cancellation | `pool.Pool` |
+| Run several things, keep the first error | `sync.WaitGroup` + a shared error var (needs its own lock) | `once.Group` |
+| Detect a lock that's stuck | not supported — `sync.Mutex.Lock()` blocks forever | `deadline.Mutex` |
+| Catch a leaked goroutine in a test | not supported — tests just pass | `leakcheck.Check(t)` |
+
+### When *not* to use this
+
+- **`safemap`** — skip it if the map never crosses a goroutine boundary,
+  or if you're on a single hot path where the tiny synchronization cost
+  actually shows up in profiling. A plain `map` is faster when nothing
+  else touches it concurrently.
+- **`pool`** — skip it for a small, fixed, known-at-compile-time number
+  of goroutines (e.g. spawning exactly 3 named workers) — plain
+  goroutines plus a `sync.WaitGroup` are simpler and clearer there.
+- **`deadline`** — Go deliberately omits timed mutexes; reach for this
+  only when you specifically want "fail loud after N seconds" behavior
+  (e.g. surfacing a stuck lock in production logs), not as a default
+  replacement for `sync.Mutex`.
+- **`leakcheck`** — it's a test-time tool; it adds a few seconds of
+  polling per test in the worst case (when something actually leaks), so
+  it's best added to tests that specifically exercise goroutine
+  lifecycles, not blanket-applied everywhere.
 
 ---
 
@@ -89,10 +120,28 @@ if err := p.Wait(); err != nil {
 ```
 
 Every job gets a `context.Context` tied to the pool. If any job returns
-an error, the pool's context is canceled, so well-behaved jobs still in
-flight can bail out instead of running to completion pointlessly.
+an error, the pool's context is canceled: queued work that hasn't
+started yet is dropped, and running work can stop early if it checks
+`ctx.Done()` (it's not preemptively killed — Go can't do that safely).
 `Wait()` blocks until every worker has actually exited — a passing
 `Wait()` is a guarantee that nothing from this pool is still running.
+
+**Behavior worth knowing before you adopt it:**
+- **Queue size:** `Submit` is unbuffered — it blocks until a worker
+  picks up the job, the pool's context is canceled, or `Wait` has
+  started closing the pool. There's no separate bounded queue to size;
+  the worker count *is* the concurrency cap.
+- **Backpressure:** because `Submit` blocks, a slow consumer naturally
+  applies backpressure to whatever's calling `Submit` — it won't buffer
+  unbounded work in memory.
+- **Panics:** a panicking job crashes the worker goroutine like any
+  other goroutine panic; `Pool` does not recover panics for you. Recover
+  inside your own job function if you need that.
+- **`Submit` after `Wait`:** undefined/unsupported — don't call `Submit`
+  once you've called `Wait`. Treat the pool as single-phase: submit,
+  then wait, don't interleave from multiple goroutines calling `Wait`.
+- **`Submit` after cancellation:** returns immediately without running
+  the job (it's dropped), since the pool is shutting down.
 
 Run the example: `go run ./examples/pool`
 
