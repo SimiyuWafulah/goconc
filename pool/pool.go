@@ -4,8 +4,10 @@
 // goroutines with no back-pressure and no guaranteed way to know when
 // they're all done or to cancel them early. Pool fixes both: it caps
 // concurrency to a fixed number of workers and ties every submitted job
-// to a context, so cancellation actually stops queued work instead of
-// leaving it to run to completion (or leak) after the caller gives up.
+// to a context. On cancellation, queued work that hasn't started yet is
+// dropped, and in-flight work can stop early if it checks ctx.Done()
+// (Go can't preemptively kill a running goroutine, so cooperative
+// cancellation is still on the job function).
 package pool
 
 import (
